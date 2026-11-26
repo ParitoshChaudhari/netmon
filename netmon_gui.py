@@ -30,7 +30,8 @@ from datetime import datetime, timedelta
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import netmon  # noqa: E402  (collector, database and formatting helpers)
@@ -48,8 +49,67 @@ BACKGROUND_ARG = "--background"  # autostart: collect data without showing the w
 CHART_REFRESH_SECONDS = 5
 REALTIME_SECONDS = 120  # width of the live download/upload chart (one sample per second)
 
-DOWN_COLOR = (0.21, 0.52, 0.89)  # blue
-UP_COLOR = (0.20, 0.82, 0.48)    # green
+# Chart colours: one calm blue and one warm amber. Both read well on light and dark
+# themes, and they stay distinct for people with red-green colour blindness.
+DOWN_COLOR = (0.21, 0.52, 0.89)  # blue   (#3584e4)
+UP_COLOR = (0.90, 0.65, 0.04)    # amber  (#e5a50a)
+
+# Neutral, theme-aware styling. Surfaces are translucent greys, so they follow
+# the light or dark theme without hard-coded backgrounds.
+STYLE_CSS = b"""
+.netmon-page {
+    padding: 18px 20px 14px 20px;
+}
+.netmon-card {
+    background-color: rgba(128, 128, 128, 0.08);
+    border: 1px solid rgba(128, 128, 128, 0.16);
+    border-radius: 14px;
+    padding: 14px 16px;
+}
+.netmon-caption {
+    font-size: 85%;
+    opacity: 0.62;
+}
+.netmon-section {
+    font-weight: 600;
+}
+.netmon-value {
+    font-size: 19pt;
+    font-weight: 600;
+}
+.netmon-session {
+    font-size: 11pt;
+}
+.netmon-table-head {
+    font-size: 85%;
+    font-weight: 600;
+    opacity: 0.62;
+}
+.netmon-today {
+    font-weight: 600;
+}
+.netmon-rule {
+    background-color: rgba(128, 128, 128, 0.16);
+    min-height: 1px;
+}
+.netmon-footer {
+    font-size: 85%;
+    opacity: 0.55;
+}
+.netmon-hint {
+    opacity: 0.7;
+}
+"""
+
+# Maps _text_label() keyword flags to the CSS classes above.
+LABEL_STYLES = {
+    "caption": "netmon-caption",
+    "section": "netmon-section",
+    "table_head": "netmon-table-head",
+    "today": "netmon-today",
+    "footer": "netmon-footer",
+    "hint": "netmon-hint",
+}
 
 
 # ---------- file helpers ----------
@@ -454,8 +514,8 @@ class NetmonWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="netmon")
         self.set_icon_name(ICON_NAME)
-        self.set_default_size(520, 560)
-        self.set_border_width(16)
+        self.set_default_size(560, 640)
+        self.set_size_request(380, 420)
 
         self.conn = netmon.open_db(netmon.DEFAULT_DB)
         self.collector = netmon.Collector(self.conn)
@@ -491,90 +551,125 @@ class NetmonWindow(Gtk.ApplicationWindow):
         self.set_titlebar(self.header)
 
     def _build_body(self):
-        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.stack.add_titled(self._build_summary(), "summary", "Summary")
-        self.stack.add_titled(self._build_charts(), "charts", "Charts")
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=200)
+        self.stack.add_titled(self._scrolled(self._build_summary()), "summary", "Summary")
+        self.stack.add_titled(self._scrolled(self._build_charts()), "charts", "Charts")
         self.stack.connect("notify::visible-child-name", self._on_page_changed)
         self.header.set_custom_title(Gtk.StackSwitcher(stack=self.stack))
         self.add(self.stack)
 
-    def _build_summary(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-
-        # Live speed section
-        speed = Gtk.Grid(column_spacing=24, row_spacing=8)
-        self.down_now = self._value_label()
-        self.up_now = self._value_label()
-        self.session = self._value_label()
-        for row, (name, value) in enumerate([
-            ("Download", self.down_now),
-            ("Upload", self.up_now),
-            ("This session", self.session),
-        ]):
-            speed.attach(self._text_label(name, dim=True), 0, row, 1, 1)
-            speed.attach(value, 1, row, 1, 1)
-        box.pack_start(speed, False, False, 0)
-
-        box.pack_start(Gtk.Separator(), False, False, 0)
-
-        # Usage table section
-        table = Gtk.Grid(column_spacing=28, row_spacing=10)
-        headers = ["Period", "Download", "Upload", "Total"]
-        for col, title in enumerate(headers):
-            table.attach(self._text_label(title, bold=True, align=col > 0), col, 0, 1, 1)
-
-        self.cells = {}
-        for row, label in enumerate(self.PERIOD_LABELS, start=1):
-            table.attach(self._text_label(label), 0, row, 1, 1)
-            down, up, total = (self._value_label(align=True) for _ in range(3))
-            for col, widget in enumerate([down, up, total], start=1):
-                table.attach(widget, col, row, 1, 1)
-            self.cells[label] = (down, up, total)
-        box.pack_start(table, False, False, 0)
-
-        self.status = self._text_label("", dim=True)
-        box.pack_end(self.status, False, False, 0)
-        box.pack_end(self._text_label("Created by Paritosh Chaudhari", dim=True), False, False, 0)
-        return box
-
-    def _build_charts(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.realtime = ChartArea(paint_realtime, 190)
-        self.hourly = ChartArea(paint_hourly, 190)
-        self.daily = ChartArea(paint_daily, 190)
-        self.ifaces = ChartArea(paint_interfaces, 210)
-        for index, (title, chart) in enumerate([
-            ("Live, last 2 minutes", self.realtime),
-            ("Last 24 hours", self.hourly),
-            ("Last 30 days", self.daily),
-            ("Network interfaces today", self.ifaces),
-        ]):
-            if index:
-                box.pack_start(Gtk.Box(), False, False, 8)  # spacing between charts
-            box.pack_start(self._text_label(title, bold=True), False, False, 0)
-            box.pack_start(chart, False, False, 0)
-
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.add(box)
+    @staticmethod
+    def _scrolled(child):
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        scroller.add(child)
         return scroller
 
     @staticmethod
-    def _text_label(text, bold=False, dim=False, align=False):
-        label = Gtk.Label(xalign=1 if align else 0)
-        markup = GLib.markup_escape_text(text)
-        if bold:
-            markup = f"<b>{markup}</b>"
-        if dim:
-            markup = f'<span alpha="70%">{markup}</span>'
-        label.set_markup(markup)
+    def _card(*children, spacing=8):
+        """A rounded surface that stacks its children vertically."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+        box.get_style_context().add_class("netmon-card")
+        for child in children:
+            box.pack_start(child, False, False, 0)
+        return box
+
+    def _build_summary(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.get_style_context().add_class("netmon-page")
+
+        # Live speed: download and upload side by side.
+        self.down_now = self._value_label(big=True)
+        self.up_now = self._value_label(big=True)
+        live = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        for caption, value in [("Download", self.down_now), ("Upload", self.up_now)]:
+            card = self._card(self._text_label(caption, caption=True), value)
+            card.set_hexpand(True)
+            live.pack_start(card, True, True, 0)
+        page.pack_start(live, False, False, 0)
+
+        # Session totals.
+        self.session = self._value_label()
+        self.session.get_style_context().add_class("netmon-session")
+        page.pack_start(self._card(self._text_label("This session", caption=True), self.session),
+                        False, False, 0)
+
+        # Usage table.
+        table = Gtk.Grid(column_spacing=24, row_spacing=10)
+        table.set_column_homogeneous(False)
+        headers = ["Period", "Download", "Upload", "Total"]
+        for col, title in enumerate(headers):
+            label = self._text_label(title, table_head=True, align=col > 0)
+            table.attach(label, col, 0, 1, 1)
+
+        self.cells = {}
+        for index, label in enumerate(self.PERIOD_LABELS):
+            row = 2 * index + 1
+            rule = Gtk.Separator()
+            rule.get_style_context().add_class("netmon-rule")
+            table.attach(rule, 0, row, len(headers), 1)
+            name = self._text_label(label, today=(index == 0))
+            name.set_hexpand(True)
+            table.attach(name, 0, row + 1, 1, 1)
+            down, up, total = (self._value_label(align=True) for _ in range(3))
+            for col, widget in enumerate([down, up, total], start=1):
+                table.attach(widget, col, row + 1, 1, 1)
+            self.cells[label] = (down, up, total)
+        page.pack_start(self._card(table), False, False, 0)
+
+        # Footer: centred, pinned to the bottom of the page.
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        footer.set_margin_top(4)
+        self.status = self._text_label("", footer=True, center=True)
+        footer.pack_start(self.status, False, False, 0)
+        footer.pack_start(self._text_label("Created by Paritosh Chaudhari", footer=True,
+                                           center=True), False, False, 0)
+        page.set_vexpand(True)  # take the full height so the footer can sit at the bottom
+        page.pack_end(footer, False, False, 0)
+        return page
+
+    def _build_charts(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.get_style_context().add_class("netmon-page")
+        self.realtime = ChartArea(paint_realtime, 180)
+        self.hourly = ChartArea(paint_hourly, 180)
+        self.daily = ChartArea(paint_daily, 180)
+        self.ifaces = ChartArea(paint_interfaces, 210)
+        for title, hint, chart in [
+            ("Live", "Last 2 minutes", self.realtime),
+            ("Last 24 hours", "Traffic per hour", self.hourly),
+            ("Last 30 days", "Traffic per day", self.daily),
+            ("Network interfaces", "Today, busiest first", self.ifaces),
+        ]:
+            heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            heading.pack_start(self._text_label(title, section=True), False, False, 0)
+            heading.pack_start(self._text_label(hint, caption=True), False, False, 0)
+            page.pack_start(self._card(heading, chart, spacing=6), False, False, 0)
+        return page
+
+    @staticmethod
+    def _text_label(text, align=False, center=False, **styles):
+        """A plain label. Pass keyword flags such as caption=True or section=True
+        to give it one of the netmon text styles defined in STYLE_CSS."""
+        label = Gtk.Label(xalign=0.5 if center else 1 if align else 0)
+        label.set_text(text)
+        if center:
+            label.set_justify(Gtk.Justification.CENTER)
+            label.set_hexpand(True)
+        context = label.get_style_context()
+        for flag, css_class in LABEL_STYLES.items():
+            if styles.get(flag):
+                context.add_class(css_class)
         return label
 
     @staticmethod
-    def _value_label(align=False):
+    def _value_label(big=False, align=False):
         label = Gtk.Label(xalign=1 if align else 0)
-        label.set_markup('<span size="large">0 B/s</span>' if not align else "0 B")
-        label.set_selectable(True)
+        label.set_text("0 B/s" if big else "0 B" if align else "")
+        if big:
+            label.get_style_context().add_class("netmon-value")
+        label.set_selectable(not big)  # speed readings are not text to copy; no caret
         return label
 
     # --- periodic update ---
@@ -610,10 +705,8 @@ class NetmonWindow(Gtk.ApplicationWindow):
     def _refresh_view(self):
         rx_rate, tx_rate = self.last_rates
 
-        self.down_now.set_markup(
-            f'<span size="large">{netmon.human_rate(rx_rate)}</span>')
-        self.up_now.set_markup(
-            f'<span size="large">{netmon.human_rate(tx_rate)}</span>')
+        self.down_now.set_text(netmon.human_rate(rx_rate))
+        self.up_now.set_text(netmon.human_rate(tx_rate))
         self.session.set_text(
             f"↓ {netmon.human_bytes(self.collector.session_rx)}   "
             f"↑ {netmon.human_bytes(self.collector.session_tx)}")
@@ -624,9 +717,9 @@ class NetmonWindow(Gtk.ApplicationWindow):
             up.set_text(netmon.human_bytes(tx))
             total.set_text(netmon.human_bytes(rx + tx))
 
-        self.status.set_markup(GLib.markup_escape_text(
+        self.status.set_text(
             f"Updated {datetime.now():%H:%M:%S} · "
-            f"Autostart {'on' if autostart_enabled() else 'off'}"))
+            f"Autostart {'on' if autostart_enabled() else 'off'}")
 
     def _refresh_realtime(self):
         self.realtime.set_data(realtime_series(self._rx_history, self._tx_history))
@@ -669,19 +762,18 @@ class NetmonWindow(Gtk.ApplicationWindow):
     def _on_settings(self, _button):
         dialog = Gtk.Dialog(title="Settings", transient_for=self, modal=True)
         dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-        dialog.set_default_size(380, 0)
+        dialog.set_default_size(400, 0)
 
         content = dialog.get_content_area()
-        content.set_border_width(18)
+        content.set_border_width(20)
         content.set_spacing(12)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        title = self._text_label("Start when I log in", bold=True)
-        hint = Gtk.Label(xalign=0, wrap=True)
-        hint.set_markup(GLib.markup_escape_text(
+        title = self._text_label("Start when I log in", section=True)
+        hint = self._text_label(
             "Open netmon automatically at login and record usage "
-            "from the start of every session."))
+            "from the start of every session.", hint=True)
         hint.set_line_wrap(True)
         text.pack_start(title, False, False, 0)
         text.pack_start(hint, False, False, 0)
@@ -720,6 +812,21 @@ class NetmonWindow(Gtk.ApplicationWindow):
 
 
 # ---------- application ----------
+
+def _apply_style():
+    """Load STYLE_CSS for every window on the screen."""
+    screen = Gdk.Screen.get_default()
+    if screen is None:  # no display; GTK will report that when the app starts
+        return
+    provider = Gtk.CssProvider()
+    try:
+        provider.load_from_data(STYLE_CSS)
+    except GLib.Error as exc:
+        print(f"netmon: could not load the window style: {exc}", file=sys.stderr)
+        return
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
 
 class NetmonApp(Gtk.Application):
     def __init__(self, start_hidden=False):
@@ -791,6 +898,7 @@ def main():
         print("netmon: the charts stay blank without the cairo bridge. Install it with: "
               "sudo apt-get install python3-gi-cairo", file=sys.stderr)
     Gtk.Window.set_default_icon_name(ICON_NAME)
+    _apply_style()
     start_hidden = BACKGROUND_ARG in sys.argv[1:]
     argv = [arg for arg in sys.argv if arg != BACKGROUND_ARG]
     return NetmonApp(start_hidden=start_hidden).run(argv)
